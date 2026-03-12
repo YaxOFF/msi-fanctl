@@ -1,0 +1,521 @@
+#!/usr/bin/env bash
+# ============================================================
+# msifan - Controlador de ventiladores MSI para Linux
+# Laptop: MSI Vector GP76 12UGSO (MS-17K4)
+# EC FW:  17K4EMS1.112
+# ============================================================
+
+set -euo pipefail
+
+# --- Rutas del sistema ---
+MSIEC="/sys/devices/platform/msi-ec"
+DEBUG="$MSIEC/debug"
+EC_SET="$DEBUG/ec_set"
+EC_GET="$DEBUG/ec_get"
+
+# Detectar home real del usuario (sudo cambia $HOME a /root)
+if [[ -n "${SUDO_USER:-}" ]]; then
+    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    REAL_HOME="$HOME"
+fi
+
+CONF_DIR="${XDG_CONFIG_HOME:-$REAL_HOME/.config}/msifan"
+PROFILES="$CONF_DIR/profiles.conf"
+
+# --- Registros EC (direcciones en hex) ---
+# CPU: 7 puntos de temperatura y 7 de velocidad
+CPU_TEMP_REGS=(6a 6b 6c 6d 6e 6f 70)
+CPU_SPEED_REGS=(72 73 74 75 76 77 78)
+CPU_CURRENT_SPEED=71
+
+# GPU: 7 puntos de temperatura y 7 de velocidad
+GPU_TEMP_REGS=(82 83 84 85 86 87 88)
+GPU_SPEED_REGS=(8a 8b 8c 8d 8e 8f 90)
+GPU_CURRENT_SPEED=89
+
+# --- Colores ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# ============================================================
+# Funciones auxiliares
+# ============================================================
+
+die() {
+    echo -e "${RED}Error: $1${RESET}" >&2
+    exit 1
+}
+
+check_root() {
+    [[ $EUID -eq 0 ]] || die "Necesitas ejecutar esto como root (sudo msifan ...)"
+}
+
+check_driver() {
+    [[ -d "$MSIEC" ]] || die "El modulo msi-ec no esta cargado. Ejecuta: sudo modprobe msi_ec debug=1"
+    [[ -d "$DEBUG" ]] || die "El modo debug no esta activo. Recarga con: sudo modprobe -r msi_ec && sudo modprobe msi_ec debug=1"
+}
+
+check_profiles() {
+    [[ -f "$PROFILES" ]] || die "No se encontro el archivo de perfiles en $PROFILES"
+}
+
+# Lee un registro EC (argumento: direccion hex, devuelve valor decimal)
+ec_read() {
+    echo "$1" > "$EC_GET"
+    local hex_val
+    hex_val=$(cat "$EC_GET")
+    printf "%d" "0x$hex_val"
+}
+
+# Escribe un registro EC (argumentos: direccion hex, valor decimal)
+ec_write() {
+    local addr="$1"
+    local dec_val="$2"
+    local hex_val
+    hex_val=$(printf "%02x" "$dec_val")
+    echo "${addr}=${hex_val}" > "$EC_SET"
+}
+
+# Busca dinámicamente el hwmon de msi_wmi_platform
+find_hwmon() {
+    for f in /sys/class/hwmon/hwmon*/name; do
+        if grep -q "msi_wmi_platform" "$f" 2>/dev/null; then
+            dirname "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Lee RPM de un ventilador (argumento: fan1_input o fan2_input)
+read_rpm() {
+    local hwmon
+    hwmon=$(find_hwmon) || { echo "N/A"; return; }
+    cat "$hwmon/$1" 2>/dev/null || echo "N/A"
+}
+
+# ============================================================
+# Comandos principales
+# ============================================================
+
+cmd_status() {
+    check_driver
+
+    local cpu_temp gpu_temp fan_mode shift_mode cooler
+    cpu_temp=$(cat "$MSIEC/cpu/realtime_temperature")
+    gpu_temp=$(cat "$MSIEC/gpu/realtime_temperature")
+    fan_mode=$(cat "$MSIEC/fan_mode")
+    shift_mode=$(cat "$MSIEC/shift_mode")
+    cooler=$(cat "$MSIEC/cooler_boost")
+
+    local cpu_rpm gpu_rpm
+    cpu_rpm=$(read_rpm fan1_input)
+    gpu_rpm=$(read_rpm fan2_input)
+
+    local cpu_fan_pct gpu_fan_pct
+    cpu_fan_pct=$(ec_read $CPU_CURRENT_SPEED)
+    gpu_fan_pct=$(ec_read $GPU_CURRENT_SPEED)
+
+    echo -e "${BOLD}╔══════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}║         msifan - Estado actual        ║${RESET}"
+    echo -e "${BOLD}╠══════════════════════════════════════╣${RESET}"
+    echo -e "${BOLD}║${RESET} Fan Mode:    ${CYAN}${fan_mode}${RESET}"
+    echo -e "${BOLD}║${RESET} Shift Mode:  ${CYAN}${shift_mode}${RESET}"
+    echo -e "${BOLD}║${RESET} Cooler Boost: $([ "$cooler" = "on" ] && echo -e "${GREEN}ON" || echo -e "${YELLOW}OFF")${RESET}"
+    echo -e "${BOLD}╠══════════════════════════════════════╣${RESET}"
+    local cpu_temp_colored gpu_temp_colored
+    cpu_temp_colored=$(color_temp "$cpu_temp")
+    gpu_temp_colored=$(color_temp "$gpu_temp")
+    echo -e "${BOLD}║${RESET}  ${BOLD}CPU${RESET}   Temp: ${cpu_temp_colored}   Fan: ${cpu_fan_pct}%   ${cpu_rpm} RPM"
+    echo -e "${BOLD}║${RESET}  ${BOLD}GPU${RESET}   Temp: ${gpu_temp_colored}   Fan: ${gpu_fan_pct}%   ${gpu_rpm} RPM"
+    echo -e "${BOLD}╠══════════════════════════════════════╣${RESET}"
+
+    if [[ "$fan_mode" == "advanced" ]]; then
+        echo -e "${BOLD}║${RESET}  Curva CPU activa:"
+        for i in "${!CPU_TEMP_REGS[@]}"; do
+            local t s
+            t=$(ec_read "${CPU_TEMP_REGS[$i]}")
+            s=$(ec_read "${CPU_SPEED_REGS[$i]}")
+            echo -e "${BOLD}║${RESET}    ${t}°C -> ${s}%"
+        done
+        echo -e "${BOLD}║${RESET}  Curva GPU activa:"
+        for i in "${!GPU_TEMP_REGS[@]}"; do
+            local t s
+            t=$(ec_read "${GPU_TEMP_REGS[$i]}")
+            s=$(ec_read "${GPU_SPEED_REGS[$i]}")
+            echo -e "${BOLD}║${RESET}    ${t}°C -> ${s}%"
+        done
+    fi
+
+    echo -e "${BOLD}╚══════════════════════════════════════╝${RESET}"
+}
+
+color_temp() {
+    local temp=$1
+    if (( temp >= 85 )); then
+        printf "${RED}%d°C${RESET}" "$temp"
+    elif (( temp >= 70 )); then
+        printf "${YELLOW}%d°C${RESET}" "$temp"
+    else
+        printf "${GREEN}%d°C${RESET}" "$temp"
+    fi
+}
+
+cmd_mode() {
+    check_root
+    check_driver
+    local mode="$1"
+
+    case "$mode" in
+        auto|silent|advanced)
+            echo "$mode" > "$MSIEC/fan_mode"
+            echo -e "${GREEN}Fan mode cambiado a: ${BOLD}${mode}${RESET}"
+            ;;
+        *)
+            die "Modo no valido. Usa: auto, silent, advanced"
+            ;;
+    esac
+}
+
+cmd_shift() {
+    check_root
+    check_driver
+    local mode="$1"
+
+    case "$mode" in
+        eco|comfort|turbo)
+            echo "$mode" > "$MSIEC/shift_mode"
+            echo -e "${GREEN}Shift mode cambiado a: ${BOLD}${mode}${RESET}"
+            ;;
+        *)
+            die "Modo no valido. Usa: eco, comfort, turbo"
+            ;;
+    esac
+}
+
+cmd_boost() {
+    check_root
+    check_driver
+    local state="$1"
+
+    case "$state" in
+        on|off)
+            echo "$state" > "$MSIEC/cooler_boost"
+            echo -e "${GREEN}Cooler Boost: ${BOLD}${state}${RESET}"
+            ;;
+        toggle)
+            local current
+            current=$(cat "$MSIEC/cooler_boost")
+            if [[ "$current" == "on" ]]; then
+                echo "off" > "$MSIEC/cooler_boost"
+                echo -e "${GREEN}Cooler Boost: ${BOLD}OFF${RESET}"
+            else
+                echo "on" > "$MSIEC/cooler_boost"
+                echo -e "${GREEN}Cooler Boost: ${BOLD}ON${RESET}"
+            fi
+            ;;
+        *)
+            die "Usa: on, off, toggle"
+            ;;
+    esac
+}
+
+cmd_profile() {
+    check_root
+    check_driver
+    check_profiles
+
+    local profile="$1"
+    local in_profile=false
+    local cpu_curve=""
+    local gpu_curve=""
+
+    # Parsear el perfil del archivo de configuracion
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=$(echo "$line" | sed 's/#.*//' | xargs)
+        [[ -z "$line" ]] && continue
+
+        if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+            if [[ "${BASH_REMATCH[1]}" == "$profile" ]]; then
+                in_profile=true
+            else
+                $in_profile && break
+            fi
+            continue
+        fi
+
+        if $in_profile; then
+            if [[ "$line" =~ ^cpu\ *=\ *(.+)$ ]]; then
+                cpu_curve="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^gpu\ *=\ *(.+)$ ]]; then
+                gpu_curve="${BASH_REMATCH[1]}"
+            fi
+        fi
+    done < "$PROFILES"
+
+    [[ -z "$cpu_curve" ]] && die "Perfil '$profile' no encontrado o sin curva CPU"
+    [[ -z "$gpu_curve" ]] && die "Perfil '$profile' no encontrado o sin curva GPU"
+
+    # Activar modo advanced
+    echo "advanced" > "$MSIEC/fan_mode"
+
+    # Aplicar curva CPU
+    local i=0
+    for point in $cpu_curve; do
+        local temp="${point%%:*}"
+        local speed="${point##*:}"
+        ec_write "${CPU_TEMP_REGS[$i]}" "$temp"
+        ec_write "${CPU_SPEED_REGS[$i]}" "$speed"
+        i=$((i + 1))
+    done
+    (( i == 7 )) || die "La curva CPU debe tener exactamente 7 puntos (tiene $i)"
+
+    # Aplicar curva GPU
+    i=0
+    for point in $gpu_curve; do
+        local temp="${point%%:*}"
+        local speed="${point##*:}"
+        ec_write "${GPU_TEMP_REGS[$i]}" "$temp"
+        ec_write "${GPU_SPEED_REGS[$i]}" "$speed"
+        i=$((i + 1))
+    done
+    (( i == 7 )) || die "La curva GPU debe tener exactamente 7 puntos (tiene $i)"
+
+    echo -e "${GREEN}Perfil '${BOLD}${profile}${RESET}${GREEN}' aplicado correctamente.${RESET}"
+}
+
+cmd_set_curve() {
+    check_root
+    check_driver
+
+    local target="$1"
+    shift
+    local points=("$@")
+
+    (( ${#points[@]} == 7 )) || die "Se requieren exactamente 7 puntos temp:vel (recibidos: ${#points[@]})"
+
+    # Activar modo advanced
+    echo "advanced" > "$MSIEC/fan_mode"
+
+    local temp_regs speed_regs
+    case "$target" in
+        cpu)
+            temp_regs=("${CPU_TEMP_REGS[@]}")
+            speed_regs=("${CPU_SPEED_REGS[@]}")
+            ;;
+        gpu)
+            temp_regs=("${GPU_TEMP_REGS[@]}")
+            speed_regs=("${GPU_SPEED_REGS[@]}")
+            ;;
+        *)
+            die "Usa: cpu o gpu"
+            ;;
+    esac
+
+    for i in "${!points[@]}"; do
+        local point="${points[$i]}"
+        local temp="${point%%:*}"
+        local speed="${point##*:}"
+
+        (( temp >= 0 && temp <= 100 )) || die "Temperatura fuera de rango (0-100): $temp"
+        (( speed >= 0 && speed <= 100 )) || die "Velocidad fuera de rango (0-100): $speed"
+
+        ec_write "${temp_regs[$i]}" "$temp"
+        ec_write "${speed_regs[$i]}" "$speed"
+    done
+
+    echo -e "${GREEN}Curva ${BOLD}${target^^}${RESET}${GREEN} aplicada.${RESET}"
+}
+
+cmd_profiles_list() {
+    check_profiles
+    echo -e "${BOLD}Perfiles disponibles:${RESET}"
+    grep -oP '(?<=\[)[^\]]+' "$PROFILES" | while read -r p; do
+        echo -e "  ${CYAN}$p${RESET}"
+    done
+}
+
+cmd_monitor() {
+    check_driver
+    watch -n 1 "$0 status"
+}
+
+cmd_save_current() {
+    check_root
+    check_driver
+    check_profiles
+
+    local name="$1"
+
+    # Verificar que estamos en advanced
+    local current_mode
+    current_mode=$(cat "$MSIEC/fan_mode")
+    [[ "$current_mode" == "advanced" ]] || die "Debes estar en modo 'advanced' para guardar la curva actual"
+
+    # Leer curva actual
+    local cpu_curve="" gpu_curve=""
+    for i in "${!CPU_TEMP_REGS[@]}"; do
+        local t s
+        t=$(ec_read "${CPU_TEMP_REGS[$i]}")
+        s=$(ec_read "${CPU_SPEED_REGS[$i]}")
+        cpu_curve+="${t}:${s} "
+    done
+
+    for i in "${!GPU_TEMP_REGS[@]}"; do
+        local t s
+        t=$(ec_read "${GPU_TEMP_REGS[$i]}")
+        s=$(ec_read "${GPU_SPEED_REGS[$i]}")
+        gpu_curve+="${t}:${s} "
+    done
+
+    cpu_curve=$(echo "$cpu_curve" | xargs)
+    gpu_curve=$(echo "$gpu_curve" | xargs)
+
+    # Verificar si el perfil ya existe
+    if grep -q "^\[$name\]" "$PROFILES" 2>/dev/null; then
+        die "El perfil '$name' ya existe. Eliminalo manualmente del archivo antes de guardarlo."
+    fi
+
+    # Agregar al archivo
+    {
+        echo ""
+        echo "[$name]"
+        echo "cpu = $cpu_curve"
+        echo "gpu = $gpu_curve"
+    } >> "$PROFILES"
+
+    echo -e "${GREEN}Curva actual guardada como perfil '${BOLD}${name}${RESET}${GREEN}'.${RESET}"
+}
+
+# ============================================================
+# Ayuda
+# ============================================================
+
+cmd_help() {
+    cat << 'EOF'
+msifan - Controlador de ventiladores MSI
+
+USO:
+  msifan status                      Estado actual (temps, RPM, curvas)
+  msifan monitor                     Status en tiempo real (watch)
+  msifan mode <auto|silent|advanced> Cambiar modo de ventilador
+  msifan shift <eco|comfort|turbo>   Cambiar shift mode (rendimiento)
+  msifan boost <on|off|toggle>       Controlar Cooler Boost
+
+  msifan profile <nombre>            Aplicar un perfil de curva guardado
+  msifan profiles                    Listar perfiles disponibles
+  msifan save <nombre>               Guardar curva actual como perfil
+
+  msifan set-curve cpu t1:v1 t2:v2 ... t7:v7
+  msifan set-curve gpu t1:v1 t2:v2 ... t7:v7
+                                     Curva manual (7 puntos temp:velocidad)
+
+EJEMPLOS:
+  sudo msifan profile gaming
+  sudo msifan boost toggle
+  sudo msifan set-curve cpu 45:20 50:40 58:55 65:65 72:80 80:90 90:100
+  sudo msifan mode auto
+
+ARCHIVO DE PERFILES:
+  ~/.config/msifan/profiles.conf
+EOF
+}
+
+# ============================================================
+# Instalacion del archivo de perfiles
+# ============================================================
+
+install_profiles() {
+    if [[ ! -f "$PROFILES" ]]; then
+        mkdir -p "$CONF_DIR"
+        local script_dir
+        script_dir=$(dirname "$(readlink -f "$0")")
+        if [[ -f "$script_dir/msifan-profiles.conf" ]]; then
+            cp "$script_dir/msifan-profiles.conf" "$PROFILES"
+        else
+            # Generar perfiles por defecto
+            cat > "$PROFILES" << 'DEFAULTEOF'
+# msifan - Perfiles de curvas de ventilador
+# Formato: cpu|gpu = temp1:vel1 temp2:vel2 ... (7 puntos exactos)
+
+[default]
+cpu = 50:0 56:40 62:49 70:58 75:67 80:76 100:85
+gpu = 55:0 60:48 65:56 70:64 75:72 80:79 98:86
+
+[silent]
+cpu = 55:0 62:25 68:35 74:45 80:55 86:65 100:75
+gpu = 60:0 66:25 72:35 76:45 80:55 86:65 100:75
+
+[gaming]
+cpu = 45:30 50:45 58:55 65:65 72:80 80:90 90:100
+gpu = 45:30 50:45 58:55 65:65 72:80 80:90 90:100
+
+[max]
+cpu = 0:100 0:100 0:100 0:100 0:100 0:100 0:100
+gpu = 0:100 0:100 0:100 0:100 0:100 0:100 0:100
+DEFAULTEOF
+        fi
+        chown "${SUDO_USER:-$USER}:${SUDO_USER:-$USER}" "$CONF_DIR" "$PROFILES" 2>/dev/null || true
+        echo -e "${GREEN}Archivo de perfiles creado en ${PROFILES}${RESET}"
+    fi
+}
+
+# ============================================================
+# Punto de entrada
+# ============================================================
+
+main() {
+    case "${1:-help}" in
+        status)
+            cmd_status
+            ;;
+        monitor)
+            cmd_monitor
+            ;;
+        mode)
+            [[ -n "${2:-}" ]] || die "Falta el modo. Usa: auto, silent, advanced"
+            cmd_mode "$2"
+            ;;
+        shift)
+            [[ -n "${2:-}" ]] || die "Falta el modo. Usa: eco, comfort, turbo"
+            cmd_shift "$2"
+            ;;
+        boost)
+            [[ -n "${2:-}" ]] || die "Falta el estado. Usa: on, off, toggle"
+            cmd_boost "$2"
+            ;;
+        profile)
+            [[ -n "${2:-}" ]] || die "Falta el nombre del perfil"
+            install_profiles
+            cmd_profile "$2"
+            ;;
+        profiles)
+            install_profiles
+            cmd_profiles_list
+            ;;
+        save)
+            [[ -n "${2:-}" ]] || die "Falta el nombre para guardar"
+            install_profiles
+            cmd_save_current "$2"
+            ;;
+        set-curve)
+            [[ -n "${2:-}" ]] || die "Falta el objetivo: cpu o gpu"
+            local target="$2"
+            shift 2
+            cmd_set_curve "$target" "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        *)
+            die "Comando desconocido: $1. Usa 'msifan help' para ver opciones."
+            ;;
+    esac
+}
+
+main "$@"
