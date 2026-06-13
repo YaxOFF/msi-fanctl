@@ -3,6 +3,7 @@
 # Los comandos que necesitan root los ejecuta internamente con sudo.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export GDK_BACKEND=wayland
+export GSK_RENDERER=gl        # evita conflicto GTK4-Vulkan + Hyprland/Intel
 # Si usas NVIDIA como GPU principal en Hyprland:
 # export __NV_PRIME_RENDER_OFFLOAD=1
 # export __GLX_VENDOR_LIBRARY_NAME=nvidia
