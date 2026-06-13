@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# msifan-gui launcher
+# Preserva las variables Wayland al elevar con sudo.
+# Uso: msifan-gui          (pide contraseña via sudo)
+#      msifan-gui --no-sudo  (sin root — solo lectura)
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GUI="$SCRIPT_DIR/msifan_gui.py"
+
+if [[ ! -f "$GUI" ]]; then
+    # Instalado en el sistema
+    GUI="$(dirname "$(command -v msifan)")/msifan_gui.py"
+fi
+
+if [[ "${1:-}" == "--no-sudo" ]]; then
+    exec python3 "$GUI"
+fi
+
+exec sudo \
+    WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+    GDK_BACKEND=wayland \
+    DISPLAY="$DISPLAY" \
+    python3 "$GUI"
