@@ -2,4 +2,8 @@
 # msifan-gui launcher — corre GUI como usuario normal (no root)
 # Los comandos que necesitan root los ejecuta internamente con sudo.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec GDK_BACKEND=wayland python3 "$SCRIPT_DIR/msifan_gui.py" "$@"
+export GDK_BACKEND=wayland
+# Si usas NVIDIA como GPU principal en Hyprland:
+# export __NV_PRIME_RENDER_OFFLOAD=1
+# export __GLX_VENDOR_LIBRARY_NAME=nvidia
+exec python3 "$SCRIPT_DIR/msifan_gui.py" "$@"
