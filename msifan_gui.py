@@ -7,32 +7,10 @@ Requiere: python3-gobject gtk4 libadwaita python3-cairo
 
 import os, sys
 
-# ── Wayland env fix ───────────────────────────────────────────────────────────
-# sudo elimina WAYLAND_DISPLAY y XDG_RUNTIME_DIR del entorno.
-# GTK4 cae a XWayland → pantalla negra en Hyprland.
-# Reconstruimos las variables desde el usuario real antes de importar GTK.
-_sudo_user = os.environ.get("SUDO_USER")
-if _sudo_user and not os.environ.get("WAYLAND_DISPLAY"):
-    import pwd, subprocess as _sp
-    try:
-        _real_uid = pwd.getpwnam(_sudo_user).pw_uid
-        os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{_real_uid}")
-        _env_out = _sp.run(
-            ["sudo", "-u", _sudo_user, "--", "env"],
-            capture_output=True, text=True, timeout=3,
-        ).stdout
-        for _line in _env_out.splitlines():
-            if _line.startswith("WAYLAND_DISPLAY="):
-                os.environ.setdefault("WAYLAND_DISPLAY", _line.split("=", 1)[1])
-            elif _line.startswith("XDG_RUNTIME_DIR="):
-                os.environ.setdefault("XDG_RUNTIME_DIR", _line.split("=", 1)[1])
-    except Exception:
-        pass
-
-os.environ["GDK_BACKEND"]        = "wayland"   # nunca caer a X11
-os.environ.setdefault("GTK_THEME",          "Adwaita:dark")
-os.environ.setdefault("GTK4_THEME",         "Adwaita:dark")
-os.environ.setdefault("GSETTINGS_BACKEND",  "memory")      # sin dconf daemon
+# GDK_BACKEND se setea en el launcher (msifan-gui).
+# La GUI corre como usuario normal — D-Bus y Wayland auth funcionan sin root.
+os.environ.setdefault("GTK_THEME",  "Adwaita:dark")
+os.environ.setdefault("GTK4_THEME", "Adwaita:dark")
 
 import gi
 gi.require_version('Gtk', '4.0')
@@ -47,14 +25,6 @@ import subprocess, math, glob, re, threading
 SYSFS = "/sys/devices/platform/msi-ec"
 HWMON = "/sys/class/hwmon"
 CONF  = os.path.expanduser("~/.config/msifan/profiles.conf")
-
-if _sudo_user:
-    import pwd as _pwd
-    _real_home = _pwd.getpwnam(_sudo_user).pw_dir
-    CONF = os.path.join(
-        os.environ.get("XDG_CONFIG_HOME", f"{_real_home}/.config"),
-        "msifan/profiles.conf",
-    )
 
 
 def _r(path, default="0"):
@@ -124,13 +94,12 @@ CSS = """
     -gtk-icon-style: regular;
 }
 
-window.msifan,
-window.msifan > *,
-window.msifan > * > *,
-window.msifan .main-bg,
-window.msifan box,
-window.msifan scrolledwindow,
-window.msifan viewport {
+window.msifan {
+    background-color: #141E26;
+    color: #D9C4B8;
+}
+
+window.msifan .root-box {
     background-color: #141E26;
     color: #D9C4B8;
 }
@@ -410,7 +379,6 @@ class MsiFanWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title="msifan")
         self.add_css_class("msifan")
         self.set_default_size(700, 560)
-        self.set_resizable(False)
         self._active_profile = None
         self._build_ui()
         GLib.timeout_add(1000, self._refresh)
@@ -439,6 +407,7 @@ class MsiFanWindow(Gtk.ApplicationWindow):
         self.set_titlebar(hb)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        root.add_css_class("root-box")
         root.set_margin_top(14)
         root.set_margin_bottom(14)
         root.set_margin_start(14)
