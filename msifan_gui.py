@@ -17,7 +17,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Gdk
 import cairo
-import subprocess, math, glob, re, threading
+import subprocess, math, glob, re, threading, time
 
 
 # ─────────────────────────────── sysfs helpers ───────────────────────────────
@@ -61,28 +61,101 @@ def shift_mode(): return _r(f"{SYSFS}/shift_mode",  "comfort")
 def boost_on():   return _r(f"{SYSFS}/cooler_boost", "off") == "on"
 def ec_ok():      return os.path.isdir(SYSFS)
 
-def list_profiles():
-    names = []
+PROFILES_HEADER = """\
+# ============================================================
+# msifan - Perfiles de curvas de ventilador
+# ============================================================
+# Formato: cpu|gpu = temp1:vel1 temp2:vel2 ... (7 puntos exactos)
+# Temperaturas en °C, velocidades en % (0-100)
+# Los puntos deben estar ordenados de menor a mayor temperatura.
+# Editado por msifan-gui.
+# ============================================================
+"""
+
+# Curva por defecto usada al crear un perfil nuevo.
+DEFAULT_CPU = [[50, 0], [56, 40], [62, 49], [70, 58], [75, 67], [80, 76], [100, 85]]
+DEFAULT_GPU = [[55, 0], [60, 48], [65, 56], [70, 64], [75, 72], [80, 79], [98, 86]]
+
+
+def read_profiles():
+    """Lee profiles.conf → dict {nombre: {'cpu': str, 'gpu': str}} preservando orden."""
+    profs = {}
+    cur = None
     try:
         for line in open(CONF):
-            m = re.match(r'^\[(.+)\]', line.strip())
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            m = re.match(r'^\[(.+)\]$', s)
             if m:
-                names.append(m.group(1))
-    except Exception:
+                cur = m.group(1)
+                profs[cur] = {}
+                continue
+            if cur and "=" in s:
+                k, v = s.split("=", 1)
+                k = k.strip()
+                if k in ("cpu", "gpu"):
+                    profs[cur][k] = v.strip()
+    except FileNotFoundError:
         pass
-    return names or ["default", "silent", "gaming", "max"]
+    return profs
 
 
-def run_cmd(*args):
-    """Ejecuta msifan con sudo en hilo separado — no bloquea la UI."""
+def write_profiles(profs):
+    """Reescribe profiles.conf desde dict {nombre: {'cpu','gpu'}}."""
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    out = [PROFILES_HEADER]
+    for name, c in profs.items():
+        out.append(f"[{name}]")
+        out.append(f"cpu = {c.get('cpu', '')}")
+        out.append(f"gpu = {c.get('gpu', '')}")
+        out.append("")
+    with open(CONF, "w") as f:
+        f.write("\n".join(out))
+
+
+def points_to_curve(points):
+    """[[t,s],...] → 'T:S T:S ...' (7 puntos, temp ascendente)."""
+    pts = sorted(([int(round(t)), int(round(s))] for t, s in points), key=lambda p: p[0])
+    return " ".join(f"{t}:{s}" for t, s in pts)
+
+
+def curve_to_points(curve, fallback):
+    """'T:S T:S ...' → [[t,s],...]. Usa fallback si no son 7 puntos validos."""
+    pts = []
+    for tok in (curve or "").split():
+        if ":" in tok:
+            t, s = tok.split(":", 1)
+            try:
+                pts.append([int(t), int(s)])
+            except ValueError:
+                pass
+    if len(pts) != 7:
+        return [p[:] for p in fallback]
+    return pts
+
+
+def list_profiles():
+    return list(read_profiles().keys()) or ["default", "silent", "gaming", "max"]
+
+
+def run_cmd(*args, on_done=None):
+    """Ejecuta msifan con sudo en hilo separado — no bloquea la UI.
+
+    on_done(ok: bool, err: str) se invoca en el hilo principal vía GLib.idle_add."""
     def _do():
+        ok, err = False, ""
         try:
-            subprocess.run(
+            r = subprocess.run(
                 ["sudo", "msifan"] + list(args),
-                capture_output=True, timeout=8,
+                capture_output=True, timeout=15, text=True,
             )
-        except Exception:
-            pass
+            ok = (r.returncode == 0)
+            err = (r.stderr or "").strip()
+        except Exception as e:
+            err = str(e)
+        if on_done is not None:
+            GLib.idle_add(on_done, ok, err)
     threading.Thread(target=_do, daemon=True).start()
 
 
@@ -262,6 +335,109 @@ window.msifan flowboxchild {
     background-color: transparent;
     padding: 0;
 }
+
+/* ── Editor de curvas ── */
+window.editor {
+    background-color: #141E26;
+    color: #D9C4B8;
+}
+window.editor .root-box { background-color: #141E26; color: #D9C4B8; }
+window.editor headerbar,
+window.editor .titlebar {
+    background-color: #0D0D0D;
+    background-image: none;
+    border-bottom: 1px solid rgba(115, 90, 81, 0.3);
+    box-shadow: none;
+}
+window.editor .card {
+    background-color: #192330;
+    border-radius: 14px;
+    border: 1px solid rgba(115, 90, 81, 0.28);
+}
+window.editor .card-inner { padding: 12px; }
+window.editor .lbl-section {
+    color: #A6877C;
+    font-size: 8px;
+    font-weight: 800;
+    letter-spacing: 4px;
+}
+window.editor .hint { color: #735A51; font-size: 9px; letter-spacing: 1px; }
+window.editor entry {
+    background-color: #0D0D0D;
+    background-image: none;
+    color: #D9C4B8;
+    border-radius: 8px;
+    border: 1px solid rgba(115, 90, 81, 0.35);
+    padding: 6px 10px;
+    caret-color: #A6877C;
+}
+window.editor entry:focus { border-color: #A6877C; }
+window.editor button.mode-btn {
+    background-color: rgba(115, 90, 81, 0.12);
+    background-image: none;
+    color: #D9C4B8;
+    border-radius: 10px;
+    border: 1px solid rgba(115, 90, 81, 0.25);
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    padding: 8px 14px;
+    box-shadow: none;
+}
+window.editor button.mode-btn:hover {
+    background-color: rgba(166, 135, 124, 0.20);
+    border-color: rgba(166, 135, 124, 0.5);
+}
+window.editor button.mode-btn.active {
+    background-color: #735A51;
+    border-color: #A6877C;
+    color: #D9C4B8;
+}
+window.editor button.act-save {
+    background-color: #735A51;
+    background-image: none;
+    color: #D9C4B8;
+    border-radius: 10px;
+    border: 1px solid #A6877C;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    padding: 10px 16px;
+    box-shadow: none;
+}
+window.editor button.act-save:hover { background-color: #8a6c61; }
+window.editor button.act-ghost {
+    background-color: rgba(115, 90, 81, 0.10);
+    background-image: none;
+    color: #A6877C;
+    border-radius: 10px;
+    border: 1px solid rgba(115, 90, 81, 0.25);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    padding: 10px 16px;
+    box-shadow: none;
+}
+window.editor button.act-ghost:hover { background-color: rgba(166, 135, 124, 0.18); }
+window.editor button.act-danger { color: #C77; border-color: rgba(200, 119, 119, 0.4); }
+window.editor button.act-danger:hover { background-color: rgba(200, 119, 119, 0.18); }
+
+window.msifan button.new-btn {
+    background-color: rgba(115, 90, 81, 0.10);
+    background-image: none;
+    color: #A6877C;
+    border-radius: 10px;
+    border: 1px solid rgba(115, 90, 81, 0.25);
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    padding: 6px 12px;
+    box-shadow: none;
+}
+window.msifan button.new-btn:hover {
+    background-color: rgba(166, 135, 124, 0.18);
+    border-color: rgba(166, 135, 124, 0.45);
+}
 """
 
 
@@ -372,6 +548,319 @@ class SensorCard(Gtk.Box):
         self.lbl_sub.set_text(f"{rpm:,} RPM")
 
 
+# ─────────────────────────────── Curve Editor ────────────────────────────────
+
+class CurveEditor(Gtk.DrawingArea):
+    """Editor de curva de 7 puntos arrastrables. Eje X = °C (0-100), Y = % (0-100)."""
+
+    PAD_L, PAD_R, PAD_T, PAD_B = 38, 12, 14, 26
+    HIT = 16  # radio de captura del punto en px
+
+    def __init__(self, color=(0.651, 0.529, 0.486)):
+        super().__init__()
+        self._color = color
+        self._points = [list(p) for p in DEFAULT_CPU]
+        self._drag_idx = None
+        self.set_size_request(440, 280)
+        self.set_draw_func(self._draw, None)
+
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin",  self._on_begin)
+        drag.connect("drag-update", self._on_update)
+        drag.connect("drag-end",    self._on_end)
+        self.add_controller(drag)
+
+    # ── datos ──
+    def set_points(self, points):
+        self._points = [[int(t), int(s)] for t, s in points]
+        self.queue_draw()
+
+    def get_points(self):
+        return [p[:] for p in self._points]
+
+    # ── mapeo data <-> pixel ──
+    def _plot(self):
+        w, h = self.get_width(), self.get_height()
+        x0, y0 = self.PAD_L, self.PAD_T
+        pw = max(w - self.PAD_L - self.PAD_R, 1)
+        ph = max(h - self.PAD_T - self.PAD_B, 1)
+        return x0, y0, pw, ph
+
+    def _to_px(self, t, s):
+        x0, y0, pw, ph = self._plot()
+        return x0 + t / 100.0 * pw, y0 + (1 - s / 100.0) * ph
+
+    def _to_data(self, px, py):
+        x0, y0, pw, ph = self._plot()
+        t = (px - x0) / pw * 100.0
+        s = (1 - (py - y0) / ph) * 100.0
+        return t, s
+
+    # ── arrastre ──
+    def _on_begin(self, _g, sx, sy):
+        self._start = (sx, sy)
+        self._drag_idx = None
+        best = self.HIT ** 2
+        for i, (t, s) in enumerate(self._points):
+            px, py = self._to_px(t, s)
+            d2 = (px - sx) ** 2 + (py - sy) ** 2
+            if d2 <= best:
+                best = d2
+                self._drag_idx = i
+
+    def _on_update(self, _g, ox, oy):
+        if self._drag_idx is None:
+            return
+        i = self._drag_idx
+        sx, sy = self._start
+        t, s = self._to_data(sx + ox, sy + oy)
+        # temp acotada entre vecinos (mantiene orden ascendente)
+        lo = self._points[i - 1][0] if i > 0 else 0
+        hi = self._points[i + 1][0] if i < 6 else 100
+        t = max(lo, min(hi, t))
+        s = max(0, min(100, s))
+        self._points[i] = [int(round(t)), int(round(s))]
+        self.queue_draw()
+
+    def _on_end(self, _g, _ox, _oy):
+        self._drag_idx = None
+
+    # ── dibujo ──
+    def _draw(self, _area, cr, w, h, _d):
+        x0, y0, pw, ph = self._plot()
+        rc, gc, bc = self._color
+
+        # grilla
+        cr.set_line_width(1)
+        cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(8)
+        for v in range(0, 101, 20):
+            # vertical (temp)
+            gx = x0 + v / 100.0 * pw
+            cr.set_source_rgba(0.45, 0.35, 0.32, 0.18)
+            cr.move_to(gx, y0); cr.line_to(gx, y0 + ph); cr.stroke()
+            cr.set_source_rgba(0.45, 0.35, 0.32, 0.9)
+            cr.move_to(gx - 6, y0 + ph + 14); cr.show_text(f"{v}")
+            # horizontal (vel)
+            gy = y0 + (1 - v / 100.0) * ph
+            cr.set_source_rgba(0.45, 0.35, 0.32, 0.18)
+            cr.move_to(x0, gy); cr.line_to(x0 + pw, gy); cr.stroke()
+            cr.set_source_rgba(0.45, 0.35, 0.32, 0.9)
+            cr.move_to(4, gy + 3); cr.show_text(f"{v:>3}")
+
+        # area + linea de la curva
+        pts_px = [self._to_px(t, s) for t, s in self._points]
+
+        cr.move_to(pts_px[0][0], y0 + ph)
+        for px, py in pts_px:
+            cr.line_to(px, py)
+        cr.line_to(pts_px[-1][0], y0 + ph)
+        cr.close_path()
+        cr.set_source_rgba(rc, gc, bc, 0.12)
+        cr.fill()
+
+        cr.set_line_width(2)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        cr.set_source_rgba(rc, gc, bc, 0.95)
+        cr.move_to(*pts_px[0])
+        for px, py in pts_px[1:]:
+            cr.line_to(px, py)
+        cr.stroke()
+
+        # puntos + etiqueta del que se arrastra
+        for i, (px, py) in enumerate(pts_px):
+            active = (i == self._drag_idx)
+            cr.set_source_rgba(0.05, 0.08, 0.12, 1.0)
+            cr.arc(px, py, 6 if active else 5, 0, 2 * math.pi); cr.fill()
+            cr.set_source_rgba(rc, gc, bc, 1.0)
+            cr.arc(px, py, 4 if active else 3, 0, 2 * math.pi); cr.fill()
+            if active:
+                t, s = self._points[i]
+                cr.set_source_rgba(0.851, 0.769, 0.722, 1.0)
+                cr.set_font_size(9)
+                cr.move_to(px + 8, py - 6)
+                cr.show_text(f"{t}°C  {s}%")
+
+
+class ProfileEditor(Gtk.Window):
+    """Dialogo para crear / editar un perfil de curvas (CPU + GPU)."""
+
+    def __init__(self, parent, name=None, on_saved=None):
+        super().__init__(title="Editor de perfil")
+        self.add_css_class("editor")
+        self.set_transient_for(parent)
+        self.set_modal(True)
+        self.set_default_size(520, 520)
+        self._parent = parent
+        self._on_saved = on_saved
+        self._editing = name
+
+        profs = read_profiles()
+        if name and name in profs:
+            cpu = curve_to_points(profs[name].get("cpu"), DEFAULT_CPU)
+            gpu = curve_to_points(profs[name].get("gpu"), DEFAULT_GPU)
+        else:
+            cpu = [list(p) for p in DEFAULT_CPU]
+            gpu = [list(p) for p in DEFAULT_GPU]
+        self._cpu = cpu
+        self._gpu = gpu
+        self._target = "cpu"
+
+        self._build(name or "")
+
+    def _build(self, name):
+        hb = Adw.HeaderBar()
+        hb.set_decoration_layout("close:")
+        title = Gtk.Label(label="EDITOR DE CURVA")
+        title.add_css_class("app-title")
+        hb.set_title_widget(title)
+        self.set_titlebar(hb)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        root.add_css_class("root-box")
+        for m in ("set_margin_top", "set_margin_bottom", "set_margin_start", "set_margin_end"):
+            getattr(root, m)(14)
+        self.set_child(root)
+
+        # nombre
+        name_card = self._card()
+        ni = name_card.get_first_child()
+        ni.append(self._section("NOMBRE DEL PERFIL"))
+        self.entry = Gtk.Entry()
+        self.entry.set_placeholder_text("mi-perfil")
+        self.entry.set_text(name)
+        if self._editing:
+            self.entry.set_sensitive(False)  # no renombrar al editar
+        ni.append(self.entry)
+        root.append(name_card)
+
+        # selector CPU / GPU
+        sel = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.btn_cpu = Gtk.Button(label="CPU")
+        self.btn_gpu = Gtk.Button(label="GPU")
+        self.btn_cpu.add_css_class("mode-btn")
+        self.btn_gpu.add_css_class("mode-btn")
+        self.btn_cpu.add_css_class("active")
+        self.btn_cpu.connect("clicked", lambda _b: self._switch("cpu"))
+        self.btn_gpu.connect("clicked", lambda _b: self._switch("gpu"))
+        sel.append(self.btn_cpu)
+        sel.append(self.btn_gpu)
+        root.append(sel)
+
+        # editor
+        ed_card = self._card()
+        ec = ed_card.get_first_child()
+        hint = Gtk.Label(label="ARRASTRA LOS PUNTOS · X = °C · Y = VELOCIDAD %")
+        hint.add_css_class("hint")
+        hint.set_halign(Gtk.Align.START)
+        ec.append(hint)
+        self.curve = CurveEditor(color=(0.651, 0.529, 0.486))
+        self.curve.set_hexpand(True)
+        self.curve.set_vexpand(True)
+        self.curve.set_points(self._cpu)
+        ec.append(self.curve)
+        ed_card.set_vexpand(True)
+        root.append(ed_card)
+
+        # acciones
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        if self._editing:
+            dele = Gtk.Button(label="ELIMINAR")
+            dele.add_css_class("act-ghost")
+            dele.add_css_class("act-danger")
+            dele.connect("clicked", self._on_delete)
+            actions.append(dele)
+        spacer = Gtk.Box(); spacer.set_hexpand(True)
+        actions.append(spacer)
+        cancel = Gtk.Button(label="CANCELAR")
+        cancel.add_css_class("act-ghost")
+        cancel.connect("clicked", lambda _b: self.close())
+        actions.append(cancel)
+        save = Gtk.Button(label="GUARDAR")
+        save.add_css_class("act-ghost")
+        save.connect("clicked", lambda _b: self._save(apply=False))
+        actions.append(save)
+        sapply = Gtk.Button(label="GUARDAR Y APLICAR")
+        sapply.add_css_class("act-save")
+        sapply.connect("clicked", lambda _b: self._save(apply=True))
+        actions.append(sapply)
+        root.append(actions)
+
+        self.status = Gtk.Label(label="")
+        self.status.add_css_class("hint")
+        self.status.set_halign(Gtk.Align.START)
+        root.append(self.status)
+
+    def _card(self):
+        c = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        c.add_css_class("card")
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        inner.add_css_class("card-inner")
+        c.append(inner)
+        return c
+
+    def _section(self, txt):
+        l = Gtk.Label(label=txt)
+        l.add_css_class("lbl-section")
+        l.set_halign(Gtk.Align.START)
+        return l
+
+    def _switch(self, target):
+        # guardar puntos actuales antes de cambiar
+        if self._target == "cpu":
+            self._cpu = self.curve.get_points()
+        else:
+            self._gpu = self.curve.get_points()
+        self._target = target
+        if target == "cpu":
+            self.btn_cpu.add_css_class("active")
+            self.btn_gpu.remove_css_class("active")
+            self.curve.set_points(self._cpu)
+        else:
+            self.btn_gpu.add_css_class("active")
+            self.btn_cpu.remove_css_class("active")
+            self.curve.set_points(self._gpu)
+
+    def _collect(self):
+        if self._target == "cpu":
+            self._cpu = self.curve.get_points()
+        else:
+            self._gpu = self.curve.get_points()
+
+    def _save(self, apply=False):
+        self._collect()
+        name = self.entry.get_text().strip()
+        if not re.fullmatch(r"[A-Za-z0-9_\-]+", name or ""):
+            self.status.set_text("Nombre invalido. Usa letras, numeros, - y _ .")
+            return
+        profs = read_profiles()
+        profs[name] = {
+            "cpu": points_to_curve(self._cpu),
+            "gpu": points_to_curve(self._gpu),
+        }
+        try:
+            write_profiles(profs)
+        except Exception as e:
+            self.status.set_text(f"Error al guardar: {e}")
+            return
+        if self._on_saved:
+            self._on_saved(name, apply)
+        self.close()
+
+    def _on_delete(self, _b):
+        name = self._editing
+        profs = read_profiles()
+        profs.pop(name, None)
+        try:
+            write_profiles(profs)
+        except Exception as e:
+            self.status.set_text(f"Error al eliminar: {e}")
+            return
+        if self._on_saved:
+            self._on_saved(None, False)
+        self.close()
+
+
 # ──────────────────────────────── Main Window ────────────────────────────────
 
 class MsiFanWindow(Gtk.ApplicationWindow):
@@ -380,6 +869,7 @@ class MsiFanWindow(Gtk.ApplicationWindow):
         self.add_css_class("msifan")
         self.set_default_size(700, 560)
         self._active_profile = None
+        self._err_until = 0.0
         self._build_ui()
         GLib.timeout_add(1000, self._refresh)
         self._refresh()
@@ -474,22 +964,59 @@ class MsiFanWindow(Gtk.ApplicationWindow):
         prof_card.append(prof_inner)
         root.append(prof_card)
 
-        prof_inner.append(self._section("PROFILES"))
-        pbox = Gtk.FlowBox()
-        pbox.set_max_children_per_line(8)
-        pbox.set_min_children_per_line(2)
-        pbox.set_selection_mode(Gtk.SelectionMode.NONE)
-        pbox.set_column_spacing(6)
-        pbox.set_row_spacing(6)
-        prof_inner.append(pbox)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        head.append(self._section("PROFILES"))
+        spacer = Gtk.Box(); spacer.set_hexpand(True)
+        head.append(spacer)
+        edit_b = Gtk.Button(label="✎ EDIT")
+        edit_b.add_css_class("new-btn")
+        edit_b.connect("clicked", self._on_edit_profile)
+        head.append(edit_b)
+        new_b = Gtk.Button(label="+ NEW")
+        new_b.add_css_class("new-btn")
+        new_b.connect("clicked", lambda _b: self._open_editor(None))
+        head.append(new_b)
+        prof_inner.append(head)
 
+        self.pbox = Gtk.FlowBox()
+        self.pbox.set_max_children_per_line(8)
+        self.pbox.set_min_children_per_line(2)
+        self.pbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.pbox.set_column_spacing(6)
+        self.pbox.set_row_spacing(6)
+        prof_inner.append(self.pbox)
+
+        self.profile_btns = {}
+        self._reload_profiles()
+
+    def _reload_profiles(self):
+        child = self.pbox.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.pbox.remove(child)
+            child = nxt
         self.profile_btns = {}
         for name in list_profiles():
             b = Gtk.Button(label=name)
             b.add_css_class("profile-btn")
             b.connect("clicked", self._on_profile, name)
             self.profile_btns[name] = b
-            pbox.append(b)
+            self.pbox.append(b)
+
+    def _open_editor(self, name):
+        ed = ProfileEditor(self, name=name, on_saved=self._on_profile_saved)
+        ed.present()
+
+    def _on_edit_profile(self, _b):
+        target = self._active_profile or (list_profiles()[0] if list_profiles() else None)
+        if target:
+            self._open_editor(target)
+
+    def _on_profile_saved(self, name, apply):
+        self._reload_profiles()
+        self._refresh()
+        if name and apply:
+            self._on_profile(None, name)
 
     def _section(self, txt):
         l = Gtk.Label(label=txt)
@@ -497,35 +1024,71 @@ class MsiFanWindow(Gtk.ApplicationWindow):
         l.set_halign(Gtk.Align.START)
         return l
 
-    def _on_fan_mode(self, _b, m): run_cmd("mode", m);         GLib.timeout_add(500, self._refresh)
-    def _on_shift(self, _b, m):    run_cmd("shift", m);        GLib.timeout_add(500, self._refresh)
-    def _on_boost(self, _b):       run_cmd("boost", "toggle"); GLib.timeout_add(500, self._refresh)
+    def _on_fan_mode(self, _b, m):
+        for k, b in self.fan_btns.items():   _tog(b, k == m)   # optimista
+        self._apply_verified("mode", m, self.fan_btns, fan_mode, 0)
+
+    def _on_shift(self, _b, m):
+        for k, b in self.shift_btns.items(): _tog(b, k == m)   # optimista
+        self._apply_verified("shift", m, self.shift_btns, shift_mode, 0)
+
+    def _apply_verified(self, cmd, value, btns, getter, tries):
+        """Aplica cmd y verifica contra sysfs; reintenta hasta 3 veces si no persiste."""
+        def done(ok, err):
+            cur = getter().strip()
+            if cur == value:
+                self._refresh()
+            elif tries < 2:
+                self._apply_verified(cmd, value, btns, getter, tries + 1)
+            else:
+                self._flash_error(err or f"No se pudo aplicar {cmd} {value}")
+                self._refresh()
+            return False
+        run_cmd(cmd, value, on_done=done)
+
+    def _on_boost(self, _b):
+        run_cmd("boost", "toggle", on_done=lambda ok, err: (
+            self._flash_error(err) if not ok else None, self._refresh(), False)[-1])
 
     def _on_profile(self, _b, name):
         self._active_profile = name
-        run_cmd("profile", name)
-        GLib.timeout_add(500, self._refresh)
+        for k, b in self.profile_btns.items(): _tog(b, k == name)
+        def done(ok, err):
+            if not ok:
+                self._flash_error(err or f"No se pudo aplicar perfil {name}")
+            self._refresh()
+            return False
+        run_cmd("profile", name, on_done=done)
+
+    def _flash_error(self, msg):
+        if not msg:
+            return
+        self._err_until = time.monotonic() + 4.0
+        self.lbl_status.set_text("● " + msg.splitlines()[0][:48])
+        self.lbl_status.remove_css_class("status-ok")
+        self.lbl_status.add_css_class("status-err")
 
     def _refresh(self):
         ok = ec_ok()
-        if ok:
-            self.lbl_status.set_text("● EC OK")
-            self.lbl_status.remove_css_class("status-err")
-            self.lbl_status.add_css_class("status-ok")
-        else:
-            self.lbl_status.set_text("● EC OFFLINE")
-            self.lbl_status.remove_css_class("status-ok")
-            self.lbl_status.add_css_class("status-err")
+        if time.monotonic() >= self._err_until:   # no pisar error reciente
+            if ok:
+                self.lbl_status.set_text("● EC OK")
+                self.lbl_status.remove_css_class("status-err")
+                self.lbl_status.add_css_class("status-ok")
+            else:
+                self.lbl_status.set_text("● EC OFFLINE")
+                self.lbl_status.remove_css_class("status-ok")
+                self.lbl_status.add_css_class("status-err")
 
         self.cpu_card.update(cpu_temp(), fan_rpm(1))
         self.gpu_card.update(gpu_temp(), fan_rpm(2))
 
-        fm = fan_mode()
-        sm = shift_mode()
+        fm = fan_mode().strip()
+        sm = shift_mode().strip()
         bo = boost_on()
 
-        for k, b in self.fan_btns.items():   _tog(b, k in fm)
-        for k, b in self.shift_btns.items(): _tog(b, k in sm)
+        for k, b in self.fan_btns.items():   _tog(b, k == fm)
+        for k, b in self.shift_btns.items(): _tog(b, k == sm)
 
         if bo:
             self.boost_btn.set_label("BOOST  ON")
