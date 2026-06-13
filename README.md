@@ -1,6 +1,6 @@
 # msifan - Controlador de Ventiladores MSI para Linux
 
-Controlador personalizado de ventiladores para laptops MSI en Linux, basado en el modulo `msi-ec`. Permite gestionar modos de ventilador, perfiles de curvas personalizadas, cooler boost y monitoreo en tiempo real a traves de una interfaz CLI.
+Controlador personalizado de ventiladores para laptops MSI en Linux, basado en el modulo `msi-ec`. Permite gestionar modos de ventilador, perfiles de curvas personalizadas, cooler boost y monitoreo en tiempo real — tanto desde la **CLI** como desde una **interfaz grafica GTK4** nativa para Wayland/Hyprland.
 
 ---
 
@@ -309,6 +309,94 @@ sudo msifan save mi_perfil
 - Formato de cada punto: `temperatura:velocidad` (ambos valores de 0 a 100).
 - Las temperaturas deben estar ordenadas de menor a mayor.
 - Las velocidades son porcentajes (0% = apagado, 100% = maximo).
+
+---
+
+## Interfaz Grafica (msifan-gui)
+
+La GUI es una aplicacion GTK4 nativa Wayland. Muestra temperatura, RPM y porcentaje de ventilador en gauges de arco en tiempo real, y permite cambiar modos, perfiles y cooler boost con un clic.
+
+### Instalacion rapida (GUI)
+
+```bash
+# Instalador automatico (CLI + GUI + .desktop)
+sudo bash install.sh
+```
+
+O manual:
+
+```bash
+sudo cp msifan /usr/local/bin/msifan
+sudo chmod +x /usr/local/bin/msifan
+sudo cp msifan_gui.py /usr/local/bin/msifan_gui.py
+sudo cp msifan-gui /usr/local/bin/msifan-gui
+sudo chmod +x /usr/local/bin/msifan-gui
+cp msifan-gui.desktop ~/.local/share/applications/
+update-desktop-database ~/.local/share/applications/
+```
+
+### Dependencias de la GUI
+
+```bash
+# Fedora
+sudo dnf install python3-gobject python3-cairo gtk4 libadwaita
+
+# Arch/Manjaro
+sudo pacman -S python-gobject python-cairo gtk4 libadwaita
+
+# Ubuntu/Debian
+sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
+```
+
+### Ejecutar
+
+```bash
+msifan-gui          # desde PATH (tras instalar)
+./msifan-gui        # desde el directorio del repo
+```
+
+Los controles que modifican el EC (modo, perfil, boost) invocan `sudo msifan` internamente. Para evitar que pida contrasena cada vez:
+
+```bash
+echo "$USER ALL=(ALL) NOPASSWD: /usr/local/bin/msifan" | sudo tee /etc/sudoers.d/msifan
+```
+
+---
+
+## Solucion: Pantalla Negra en Hyprland (GTK4)
+
+Este problema afecta a aplicaciones GTK4 en Hyprland con GPU Intel y es causado por una incompatibilidad entre el renderer Vulkan de GTK4 y el compositor de Hyprland.
+
+### Causa Raiz
+
+GTK4 usa por defecto el renderer **Vulkan** (`GSK_RENDERER=vulkan`). En sistemas con Intel iGPU bajo Hyprland, el pipeline Vulkan de GTK entra en conflicto con el compositor, resultando en una superficie opaca negra en vez de renderizar el contenido.
+
+### Solucion
+
+Forzar el renderer **OpenGL** en vez de Vulkan:
+
+```bash
+GSK_RENDERER=gl GDK_BACKEND=wayland python3 msifan_gui.py
+```
+
+El launcher `msifan-gui` ya aplica estas variables automaticamente. No es necesario configurar nada manualmente.
+
+### Por Que No Usar `sudo` Para la GUI
+
+Ejecutar la GUI con `sudo python3 msifan_gui.py` tambien causa pantalla negra por una razon diferente: `sudo` elimina las variables de entorno de sesion (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`). Sin estas variables:
+
+- GTK4 no puede conectar al compositor Wayland
+- El bus D-Bus de sesion no es accesible
+- GTK muestra el error: `Unable to acquire session bus`
+
+**Solucion:** La GUI corre como usuario normal. Los comandos que necesitan root (`msifan mode`, `msifan profile`, etc.) se ejecutan internamente con `sudo msifan`.
+
+### Tabla de Variables de Entorno
+
+| Variable | Valor | Proposito |
+|---|---|---|
+| `GDK_BACKEND` | `wayland` | Fuerza backend Wayland, evita caida a XWayland |
+| `GSK_RENDERER` | `gl` | Renderer OpenGL, evita conflicto Vulkan+Hyprland |
 
 ---
 
