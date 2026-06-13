@@ -328,9 +328,11 @@ O manual:
 ```bash
 sudo cp msifan /usr/local/bin/msifan
 sudo chmod +x /usr/local/bin/msifan
-sudo cp msifan_gui.py /usr/local/bin/msifan_gui.py
 sudo cp msifan-gui /usr/local/bin/msifan-gui
 sudo chmod +x /usr/local/bin/msifan-gui
+# La GUI es un paquete Python — copiar el directorio completo
+sudo mkdir -p /usr/local/lib/msifan-gui
+sudo cp -r msifan_gui /usr/local/lib/msifan-gui/
 cp msifan-gui.desktop ~/.local/share/applications/
 update-desktop-database ~/.local/share/applications/
 ```
@@ -376,14 +378,14 @@ GTK4 usa por defecto el renderer **Vulkan** (`GSK_RENDERER=vulkan`). En sistemas
 Forzar el renderer **OpenGL** en vez de Vulkan:
 
 ```bash
-GSK_RENDERER=gl GDK_BACKEND=wayland python3 msifan_gui.py
+GSK_RENDERER=gl GDK_BACKEND=wayland python3 -m msifan_gui
 ```
 
 El launcher `msifan-gui` ya aplica estas variables automaticamente. No es necesario configurar nada manualmente.
 
 ### Por Que No Usar `sudo` Para la GUI
 
-Ejecutar la GUI con `sudo python3 msifan_gui.py` tambien causa pantalla negra por una razon diferente: `sudo` elimina las variables de entorno de sesion (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`). Sin estas variables:
+Ejecutar la GUI con `sudo python3 -m msifan_gui` tambien causa pantalla negra por una razon diferente: `sudo` elimina las variables de entorno de sesion (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`). Sin estas variables:
 
 - GTK4 no puede conectar al compositor Wayland
 - El bus D-Bus de sesion no es accesible
@@ -517,8 +519,12 @@ sudo cat /sys/devices/platform/msi-ec/debug/ec_dump
 
 ## Estructura de Archivos
 
+### Instalado en el sistema
+
 ```
-/usr/local/bin/msifan                    Script principal
+/usr/local/bin/msifan                    Script principal (CLI)
+/usr/local/bin/msifan-gui                Launcher de la GUI
+/usr/local/lib/msifan-gui/msifan_gui/    Paquete Python de la GUI
 ~/.config/msifan/profiles.conf           Perfiles de curvas
 /etc/modprobe.d/msi-ec.conf              Opciones del modulo (debug=1)
 /etc/modules-load.d/msi-ec.conf          Carga automatica del modulo
@@ -526,6 +532,38 @@ sudo cat /sys/devices/platform/msi-ec/debug/ec_dump
 /sys/devices/platform/msi-ec/debug/      Interfaz debug (ec_dump, ec_get, ec_set)
 /sys/class/hwmon/hwmonX/                 RPM reales (msi_wmi_platform)
 ```
+
+### Paquete de la GUI (`msifan_gui/`)
+
+La GUI esta organizada en capas: cada modulo tiene una sola responsabilidad,
+asi agregar features no obliga a tocar un archivo gigante.
+
+```
+msifan_gui/
+├── __init__.py     Setup de gi/Gtk + mapa del paquete
+├── __main__.py     Entry point: python3 -m msifan_gui
+├── config.py       Constantes: rutas sysfs, perfiles default, colores del tema
+├── backend.py      Lectura de sensores sysfs + ejecucion de `msifan` (sudo)
+├── profiles.py     IO de profiles.conf + conversion curva <-> puntos
+├── style.py        Hoja CSS de la aplicacion
+├── widgets.py      Widgets reutilizables (ArcGauge, SensorCard, CurveEditor)
+├── editor.py       Ventana ProfileEditor (crear/editar/eliminar perfil)
+├── window.py       MsiFanWindow (ventana principal)
+└── app.py          MsiFanApp + main()
+```
+
+**Donde agregar una feature:**
+
+| Feature                    | Archivo                                      |
+|----------------------------|----------------------------------------------|
+| Widget reutilizable nuevo  | `widgets.py`                                 |
+| Ventana / dialogo nuevo    | archivo propio (usar `editor.py` de plantilla) |
+| Accion sobre el EC         | wrapper en `backend.py` + boton en `window.py` |
+| Constante / color / ruta   | `config.py`                                  |
+| Estilo / CSS               | `style.py`                                   |
+
+Dependencias entre capas (siempre hacia abajo, sin ciclos):
+`app → window → {widgets, editor, backend, profiles} → config`
 
 ---
 

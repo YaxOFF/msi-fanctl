@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=MSI Fan Control
 Comment=Fan controller for MSI GP76 via EC
-Exec=env GDK_BACKEND=wayland GSK_RENDERER=gl python3 /usr/local/bin/msifan_gui.py
+Exec=/usr/local/bin/msifan-gui
 Icon=cpu
 Terminal=false
 Type=Application

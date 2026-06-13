@@ -82,8 +82,14 @@ fi
 info "Instalando archivos en /usr/local/bin..."
 
 install -m 755 "$SCRIPT_DIR/msifan"          /usr/local/bin/msifan
-install -m 644 "$SCRIPT_DIR/msifan_gui.py"   /usr/local/bin/msifan_gui.py
 install -m 755 "$SCRIPT_DIR/msifan-gui"      /usr/local/bin/msifan-gui
+
+# La GUI es un paquete Python — se instala bajo /usr/local/lib/msifan-gui
+# y el launcher la ejecuta con `python3 -m msifan_gui` (ver msifan-gui).
+PKG_DST="/usr/local/lib/msifan-gui/msifan_gui"
+rm -rf "$PKG_DST"
+mkdir -p "$PKG_DST"
+install -m 644 "$SCRIPT_DIR/msifan_gui"/*.py "$PKG_DST/"
 
 ok "Binarios instalados"
 
